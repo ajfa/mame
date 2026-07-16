@@ -107,9 +107,11 @@ private:
 
 	uint8_t m_cr;
 	uint8_t m_air;
+	uint8_t m_isr;
 
 	uint8_t m_irq_level[5];
 
+	void update_interrupt();
 	void set_interrupt();
 	void clear_interrupt();
 

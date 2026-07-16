@@ -130,7 +130,8 @@ tpi6525_device::tpi6525_device(const machine_config &mconfig, const char *tag, d
 	m_cb_level(0),
 	m_interrupt_level(0),
 	m_cr(0),
-	m_air(0)
+	m_air(0),
+	m_isr(0)
 {
 	for (auto & elem : m_irq_level)
 	{
@@ -164,6 +165,7 @@ void tpi6525_device::device_start()
 	save_item(NAME(m_interrupt_level));
 	save_item(NAME(m_cr));
 	save_item(NAME(m_air));
+	save_item(NAME(m_isr));
 	save_item(NAME(m_irq_level));
 }
 
@@ -180,29 +182,52 @@ void tpi6525_device::device_reset()
     IMPLEMENTATION
 ***************************************************************************/
 
-void tpi6525_device::set_interrupt()
+void tpi6525_device::update_interrupt()
 {
-	if (!m_interrupt_level && (m_air != 0))
-	{
-		m_interrupt_level = 1;
+	// In prioritized mode (CR bit 1) an interrupt acknowledged by reading AIR goes
+	// "in service": /IRQ stays inhibited for pending interrupts of equal or lower
+	// priority until the CPU writes AIR (end-of-interrupt), which pops the
+	// in-service state. New edges still latch while in service and (re)assert
+	// /IRQ after the EOI write.
+	int level;
 
-		DBG_LOG(machine(), 3, "tpi6525", ("%s set interrupt\n", tag()));
+	if (PRIORIZED_INTERRUPTS)
+	{
+		int top_pending = -1;
+		int top_service = -1;
+
+		for (int i = 4; i >= 0; i--)
+			if (BIT(m_air, i)) { top_pending = i; break; }
+		for (int i = 4; i >= 0; i--)
+			if (BIT(m_isr, i)) { top_service = i; break; }
+
+		level = (top_pending > top_service) ? 1 : 0;
+	}
+	else
+	{
+		level = (m_air != 0) ? 1 : 0;
+	}
+
+	if (level != m_interrupt_level)
+	{
+		m_interrupt_level = level;
+
+		DBG_LOG(machine(), 3, "tpi6525", ("%s %s interrupt\n", tag(), level ? "set" : "clear"));
 
 		m_out_irq_cb(m_interrupt_level);
 	}
 }
 
 
+void tpi6525_device::set_interrupt()
+{
+	update_interrupt();
+}
+
+
 void tpi6525_device::clear_interrupt()
 {
-	if (m_interrupt_level && (m_air == 0))
-	{
-		m_interrupt_level = 0;
-
-		DBG_LOG(machine(), 3, "tpi6525", ("%s clear interrupt\n", tag()));
-
-		m_out_irq_cb(m_interrupt_level);
-	}
+	update_interrupt();
 }
 
 
@@ -416,28 +441,29 @@ uint8_t tpi6525_device::read(offs_t offset)
 			if (m_air & 0x10)
 			{
 				data = 0x10;
-				m_air &= ~0x10;
 			}
 			else if (m_air & 8)
 			{
 				data = 8;
-				m_air &= ~8;
 			}
 			else if (m_air & 4)
 			{
 				data = 4;
-				m_air &= ~4;
 			}
 			else if (m_air & 2)
 			{
 				data = 2;
-				m_air &= ~2;
 			}
 			else if (m_air & 1)
 			{
 				data = 1;
-				m_air &= ~1;
 			}
+
+			// the acknowledged interrupt moves from the latch into "in service";
+			// it keeps equal/lower priority interrupts off /IRQ until AIR is
+			// written (end-of-interrupt)
+			m_air &= ~data;
+			m_isr |= data;
 		}
 		else
 		{
@@ -533,7 +559,21 @@ void tpi6525_device::write(offs_t offset, uint8_t data)
 		break;
 
 	case 7:
-		/* m_air = data; */
+		if (PRIORIZED_INTERRUPTS)
+		{
+			// end-of-interrupt: pop the highest-priority in-service interrupt;
+			// a pending latched interrupt (re)asserts /IRQ afterwards
+			for (int i = 4; i >= 0; i--)
+			{
+				if (BIT(m_isr, i))
+				{
+					m_isr &= ~(1 << i);
+					break;
+				}
+			}
+
+			set_interrupt();
+		}
 		break;
 	}
 }

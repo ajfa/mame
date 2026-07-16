@@ -24,6 +24,7 @@
 #include "cpu/i86/i86.h"
 #include "imagedev/snapquik.h"
 #include "machine/6525tpi.h"
+#include "machine/i8255.h"
 #include "machine/ds75160a.h"
 #include "machine/ds75161a.h"
 #include "machine/input_merger.h"
@@ -69,6 +70,7 @@ namespace {
 #define EXT_I8259A_TAG  "ext_u3"
 #define EXT_MOS6526_TAG "ext_u15"
 #define EXT_MOS6525_TAG "ext_u16"
+#define EXT_I8255_TAG   "ext_u17"
 
 class cbm2_state : public driver_device
 {
@@ -100,6 +102,8 @@ public:
 		m_basic(*this, "basic"),
 		m_kernal(*this, "kernal"),
 		m_charom(*this, "charom"),
+		m_ipc6509(*this, "ipc6509"),
+		m_cobalt_ram(*this, "cobalt_ram", 0x100000, ENDIANNESS_LITTLE),
 		m_buffer_ram(*this, "buffer_ram", 0x800, ENDIANNESS_LITTLE),
 		m_extbuf_ram(*this, "extbuf_ram", 0x800, ENDIANNESS_LITTLE),
 		m_video_ram(*this, "video_ram", 0x800, ENDIANNESS_LITTLE),
@@ -139,6 +143,14 @@ public:
 	required_memory_region m_basic;
 	required_memory_region m_kernal;
 	required_memory_region m_charom;
+	optional_memory_region m_ipc6509;   // Cobalt: Pleban 6509.bin boot/IPC ROM (EPROM3+4)
+	// Cobalt IPC data bus model: the 6509's card-CIA port A and the 8088's 8255 port B
+	// share one bus. Snoop the CIA PRA/DDRA writes so each reader can compose the bus:
+	// bits with DDRA=1 are driven by the CIA (PRA), the rest by the 8088 (m_ipc_data).
+	uint8_t m_ipc_cia_pra = 0;
+	uint8_t m_ipc_cia_ddra = 0;
+	uint8_t m_ipc_status = 0xff;   // last valid kbd/serial STATUS byte ($C4-signature) the 6509 drove
+	memory_share_creator<uint8_t> m_cobalt_ram;   // Cobalt: 8088 board DRAM (1 MB, flat)
 	memory_share_creator<uint8_t> m_buffer_ram;
 	memory_share_creator<uint8_t> m_extbuf_ram;
 	memory_share_creator<uint8_t> m_video_ram;
@@ -192,6 +204,10 @@ public:
 	uint8_t ext_tpi_pb_r();
 	void ext_tpi_pb_w(uint8_t data);
 	void ext_tpi_pc_w(uint8_t data);
+	// native-hybrid IPC data bus (6525 TPI PA <-> card CIA PA), cobalt-style clean latch
+	uint8_t ext_tpi_pa_r();
+	void ext_tpi_pa_w(uint8_t data);
+	uint8_t ext_cia_pa_r();
 
 	void ext_cia_irq_w(int state);
 	uint8_t ext_cia_pb_r();
@@ -220,6 +236,7 @@ public:
 
 	uint8_t m_ext_cia_pb;
 	uint8_t m_ext_tpi_pb;
+	uint8_t m_ipc_data_88 = 0xff;   // native-hybrid: byte the 8088 drives onto the IPC data bus
 
 	// timers
 	emu_timer *m_todclk_timer;
@@ -244,7 +261,14 @@ class cbm2hp_state : public cbm2_state
 public:
 	cbm2hp_state(const machine_config &mconfig, device_type type, const char *tag)
 		: cbm2_state(mconfig, type, tag)
-	{ }
+		, m_ext_ppi(*this, EXT_I8255_TAG)
+		, m_ipc_data(0xff)
+		, m_ipc_sem88(0)
+		, m_ipc_sem65(0)
+		, m_ipc_dram_enable(0)
+		, m_ipc_int0(0)
+		, m_ext_ppi_pc(0)
+	{ cobalt_i2c_init(); }
 
 	virtual void read_pla(offs_t offset, int ras, int cas, int refen, int eras, int ecas,
 		int *casseg1, int *casseg2, int *casseg3, int *casseg4, int *rasseg1, int *rasseg2, int *rasseg3, int *rasseg4) override;
@@ -256,6 +280,52 @@ public:
 	void cbm730(machine_config &config);
 	void cbm720(machine_config &config);
 	void bx256hp(machine_config &config);
+
+	// Pleban "Cobalt" 8088 replica (runs MS-DOS/PC-DOS via 64K BIOS in 8088.bin)
+	void cbm2cobalt(machine_config &config);
+	void ext_mem_cobalt(address_map &map) ATTR_COLD;
+	void ext_io_cobalt(address_map &map) ATTR_COLD;
+	uint8_t cobalt_reg_r(offs_t offset);
+	void cobalt_reg_w(offs_t offset, uint8_t data);
+	uint8_t cobalt_hi_r(offs_t offset);
+	void cobalt_hi_w(offs_t offset, uint8_t data);
+
+	// Cobalt IPC i8255 PPI @ 0x20 (replaces the 6525 TPI of the original card)
+	optional_device<i8255_device> m_ext_ppi;
+	uint8_t m_ipc_data;        // port B <-> 6509 shared data byte
+	int m_ipc_sem88;           // PC6: 8088->6509 semaphore  (-> CIA $db01 PB2)
+	int m_ipc_sem65;           // 6509's semaphore (CIA $db01 PB3) -> 8255 PA3 (pbsem65)
+	int m_ipc_dram_enable;     // DRAM_ENABLE bus-arbitration latch
+	int m_ipc_int0;            // INT0 line state (6509->8088, CIA $db00 PB6)
+	uint8_t m_ext_ppi_pc;      // last port C value (gate logging of LED churn)
+	uint8_t ext_ppi_pa_r();
+	uint8_t ext_ppi_pb_r();
+	void ext_ppi_pb_w(uint8_t data);
+	void ext_ppi_pc_w(uint8_t data);
+	uint8_t cobalt_cia_pb_r();
+	void cobalt_cia_pb_w(uint8_t data);
+	uint8_t cobalt_cia_pa_r();
+	void cobalt_cia_pa_w(uint8_t data);
+
+	// Cobalt I2C bus on CPLD REG_IO ($E2): open-drain SDA(bit0)/SCL(bit1), bitbanged by
+	// the 8088 (payload/i2c.asm). Hardware_Check requires a slave to ACK the RTC ($D0) and
+	// EEPROM ($A0/$A2) addresses or it HLTs. Minimal slave state machine + RTC NVRAM/EEPROM.
+	enum { I2C_IDLE, I2C_RX_ADDR, I2C_RX_DATA, I2C_TX_DATA, I2C_ACK_S, I2C_ACK_M };
+	enum { I2C_DEV_NONE, I2C_DEV_RTC, I2C_DEV_EEPROM };
+	int m_i2c_sda, m_i2c_scl;      // master-driven line states (last $E2 write)
+	int m_i2c_slave_sda;           // slave pull (0 = driving low; wired-AND with master)
+	int m_i2c_state, m_i2c_bitcnt;
+	uint8_t m_i2c_shift, m_i2c_out;
+	int m_i2c_dev, m_i2c_reading, m_i2c_got_ptr, m_i2c_ack;
+	uint8_t m_i2c_ptr;
+	uint8_t m_i2c_rtc[64];         // regs 0-7 clock, 8-63 NVRAM (CMOS config)
+	uint8_t m_i2c_eeprom[256];
+	void i2c_io(int sda, int scl);
+	void i2c_scl_rising(int sda);
+	void i2c_scl_falling();
+	uint8_t i2c_dev_read();
+	void i2c_dev_write(uint8_t v);
+	void cobalt_i2c_init();
 };
 
 
@@ -524,6 +594,15 @@ uint8_t cbm2_state::read(offs_t offset)
 		if (!kernalcs)
 		{
 			data = m_kernal->base()[offset & 0x1fff];
+			// COBALT DIAG (temp): trace KERNAL IPC server $fd48 path waypoints.
+			if (m_ipc6509)
+			{
+				offs_t k = offset & 0x1fff;   // $E000-base
+				if (k == 0x1d48 || k == 0x1d8b || k == 0x1d96 || k == 0x1dc3 ||
+					k == 0x1dcc || k == 0x1d71 || k == 0x1d76 || k == 0x1d79 ||
+					k == 0x1d7c || k == 0x1d82 || k == 0x1d85)
+					logerror("%s: 6509 SRVR $%04X\n", machine().describe_context(), 0xe000 | k);
+			}
 		}
 		if (!crtccs)
 		{
@@ -562,6 +641,38 @@ uint8_t cbm2_state::read(offs_t offset)
 		}
 
 		data = m_exp->read(offset & 0x1fff, data, csbank1, csbank2, csbank3);
+
+		// Cobalt: Pleban's 8K 6509.bin boot/IPC ROM occupies the EPROM4 ($C000) and
+		// EPROM3 ($2000) cartridge windows (4K each) in the system bank. Its $C000
+		// entry jump table dispatches into both halves (e.g. JMP $C243 / JMP $2073).
+		if (m_ipc6509)
+		{
+			// Layout (from disassembly): 6509.bin is 8K CONTIGUOUS in the cartridge window
+			// $2000-$3FFF (system bank). KERNAL autostart finds its signature at $2006-$2009
+			// and JMPs $2000 -> cold-start $2073 -> boot menu. F19 ($201F->$393e) calls
+			// RUNCOPRO ($FF72) to start the 8088.
+			offs_t a = offset & 0xffff;
+			if (a >= 0x2000 && a <= 0x3fff)
+				data = m_ipc6509->base()[a & 0x1fff];
+			// COBALT DIAG (temp): flag entry to the IPC handlers (opcode fetch at entry).
+			if (a == 0x3993 || a == 0x39b1 || a == 0x3a27 || a == 0x3566)
+				logerror("%s: 6509 HANDLER fetch $%04X\n", machine().describe_context(), a);
+		}
+	}
+
+	// INCREMENT F part 2 FIX: the 8088 copies the payload to its segment F, which the CPLD's
+	// +1 bank adder maps to DRAM bank 0 (shared between the 8088 and the 6509). The fn-0x22
+	// upload handler ($3993/$39b1) reads that payload via `($91),y` with indirect bank $01=0
+	// = bank 0. The stock CBM-II decode leaves bank 0 DRAM unbacked (returns $FF), so the
+	// upload found an empty file table and copied nothing. Back the 6509's bank-0 DRAM with
+	// the SAME m_cobalt_ram slot the 8088's segment-F writes (cobalt_hi_w) land in.
+	// INCREMENT F part 3: also back banks 5-14 (the card's RAM-board DRAM beyond the CBM-II's
+	// 256K): the fn94 screen convert reads the 8088's MDA buffer (seg B) through bank $0C.
+	if (m_ipc6509)
+	{
+		int bank = offset >> 16;
+		if (bank == 0 || (bank >= 5 && bank <= 14))
+			data = m_cobalt_ram[offset & 0xfffff];
 	}
 
 	return data;
@@ -604,6 +715,17 @@ void cbm2_state::write(offs_t offset, uint8_t data)
 		}
 	}
 
+	// INCREMENT F part 2 FIX (mirror of the bank-0 read): the 8088's segment F and the 6509's
+	// bank 0 share the same DRAM. Back the 6509's bank-0 DRAM writes with the same m_cobalt_ram
+	// slot so both processors see the same bytes (the stock decode leaves bank 0 unbacked).
+	// F part 3: banks 5-14 = card RAM-board DRAM, same slots the 8088's ext_write uses.
+	if (m_ipc6509)
+	{
+		int bank = offset >> 16;
+		if (bank == 0 || (bank >= 5 && bank <= 14))
+			m_cobalt_ram[offset & 0xfffff] = data;
+	}
+
 	if (!sysioen)
 	{
 		if (!buframcs)
@@ -612,6 +734,9 @@ void cbm2_state::write(offs_t offset, uint8_t data)
 		}
 		if (!extbufcs && m_extbuf_ram)
 		{
+			// DIAG F3: catch whoever rewrites the IPC server's param counters mid-service
+			if (m_ipc6509 && ((offset & 0xffff) >= 0x0800 && (offset & 0xffff) <= 0x0804))
+				logerror("%s: 6509 W $%04X = %02X\n", machine().describe_context(), offset & 0xffff, data);
 			m_extbuf_ram[offset & 0x7ff] = data;
 		}
 		if (!vidramcs)
@@ -635,6 +760,14 @@ void cbm2_state::write(offs_t offset, uint8_t data)
 		}
 		if (!extprtcs && m_ext_cia)
 		{
+			// DIAG F3: trace card-CIA ICR(mask) writes - the IPC FLAG enable/disable dance
+			if (m_ipc6509 && (offset & 0x0f) == 0x0d)
+				logerror("%s: 6509 card-CIA ICR write %02X\n", machine().describe_context(), data);
+			// Snoop card-CIA PRA/DDRA so the 8088 side (cobalt 8255 OR native 6525 TPI) can
+			// compose the shared IPC data bus. Ungated (native-hybrid 2026-07-03): bx256hp needs
+			// it too so ext_tpi_pa_r conveys the 6509's driven data byte to the 8088.
+			if ((offset & 0x0f) == 0x00) m_ipc_cia_pra = data;
+			if ((offset & 0x0f) == 0x02) m_ipc_cia_ddra = data;
 			m_ext_cia->write(offset & 0x0f, data);
 		}
 		if (!ciacs)
@@ -692,6 +825,22 @@ uint8_t cbm2_state::ext_read(offs_t offset)
 	return data;
 #endif
 
+	// Cobalt: the Pleban card carries its own 8088 board DRAM (640K usable / 1 MB mapped),
+	// flat across the 8088's address space. The IPC param table (ipctab @ seg MemTop-10h =
+	// $9FF0) and the payload data segment live up here ($40000-$9FFFF), which the stock
+	// CBM-II 256K decode never backs -> previously read 0, so rqster saw #ins/#outs = 0 and
+	// sent commands with no parameters. Back the whole space with m_cobalt_ram.
+	if (m_ipc6509)
+	{
+		// Low 256K stays aliased to the shared CBM-II DRAM (m_ram) as the boot relies on;
+		// the high region ($40000-$EFFFF) is the card's own 8088 DRAM (ipctab, payload data).
+		// INCREMENT F part 3: index m_cobalt_ram by 6509 bank number (= 8088 segment + 1, the
+		// CPLD's +1 adder), so the 6509's bank-C reads of the MDA buffer (8088 seg B) and the
+		// bank-0 slot (8088 seg F, cobalt_hi_w) all share one consistent convention.
+		if (offset < 0x40000) return m_ram->pointer()[offset];
+		return m_cobalt_ram[(offset + 0x10000) & 0xfffff];
+	}
+
 	uint8_t data = 0;
 	if (offset < 0x40000) data = m_ram->pointer()[offset];
 	return data;
@@ -727,6 +876,14 @@ void cbm2_state::ext_write(offs_t offset, uint8_t data)
 		m_ram->pointer()[0x30000 | (offset & 0xffff)] = data;
 	}
 #endif
+
+	if (m_ipc6509)
+	{
+		// Same 6509-bank indexing as ext_read (seg N -> slot N+1).
+		if (offset < 0x40000) m_ram->pointer()[offset] = data;
+		else m_cobalt_ram[(offset + 0x10000) & 0xfffff] = data;
+		return;
+	}
 
 	if (offset < 0x40000) m_ram->pointer()[offset] = data;
 }
@@ -1167,6 +1324,440 @@ void cbm2_state::ext_mem(address_map &map)
 {
 	map(0x00000, 0xeffff).r(FUNC(cbm2_state::ext_read)).w(FUNC(cbm2_state::ext_write));
 	map(0xf0000, 0xf0fff).mirror(0xf000).rom().region(EXT_I8088_TAG, 0);
+}
+
+
+//-------------------------------------------------
+//  ADDRESS_MAP( ext_mem_cobalt ) - Pleban replica: full 64K 8088 BIOS at F0000-FFFFF
+//-------------------------------------------------
+
+void cbm2hp_state::ext_mem_cobalt(address_map &map)
+{
+	map(0x00000, 0xeffff).r(FUNC(cbm2_state::ext_read)).w(FUNC(cbm2_state::ext_write));
+	// 8088 bank 15 ($F0000-$FFFFF): reads come from the 64K BIOS EPROM (BIOS + payload image),
+	// but WRITES go to shared DRAM bank 0 (CPLD's +1 adder remaps 8088 segment F -> bank 0).
+	// That is how Bootstrap_Load's `rep movsb F000:0 -> F000:0` copies the payload from EPROM
+	// into DRAM bank 0 (the m_cobalt_ram bank-0 slot, see cobalt_hi_w), where the fn-0x22
+	// upload ($3993) reads the file table at bank0:$000A (see the bank-0 routing in read()).
+	map(0xf0000, 0xfffff).rw(FUNC(cbm2hp_state::cobalt_hi_r), FUNC(cbm2hp_state::cobalt_hi_w));
+}
+
+uint8_t cbm2hp_state::cobalt_hi_r(offs_t offset)
+{
+	return memregion(EXT_I8088_TAG)->base()[offset & 0xffff];   // BIOS EPROM (reads)
+}
+
+void cbm2hp_state::cobalt_hi_w(offs_t offset, uint8_t data)
+{
+	// INCREMENT F part 2 FIX: the CPLD's +1 bank adder maps 8088 segment F (top nibble F)
+	// to DRAM bank 0, which is a DIFFERENT bank from segment 0 (-> bank 1). The 8088's int7
+	// vector / zero page lives in segment 0 (== 6509 bank 1 == m_ram[0], verified by trace).
+	// Previously this payload-copy aliased m_ram[0], CLOBBERING the int7 vector ([0:001E]
+	// $9FF0 -> $E81C) so the rqster read an uninitialized ipctab and fn22/late-fn12 hung.
+	// Back 8088 "bank 0" (segment F) with its own slot in m_cobalt_ram, distinct from m_ram[0].
+	m_cobalt_ram[offset & 0xffff] = data;
+}
+
+
+//-------------------------------------------------
+//  ADDRESS_MAP( ext_io_cobalt ) - adds the Cobalt CPLD register file at 0xE0-0xEF
+//-------------------------------------------------
+
+void cbm2hp_state::ext_io_cobalt(address_map &map)
+{
+	map(0x0000, 0x0001).mirror(0x1e).rw(m_ext_pic, FUNC(pic8259_device::read), FUNC(pic8259_device::write));
+	// Cobalt replica: i8255 PPI (CS_8255 decodes 0x20-0x3f) instead of the 6525 TPI
+	map(0x0020, 0x0023).mirror(0x1c).rw(m_ext_ppi, FUNC(i8255_device::read), FUNC(i8255_device::write));
+	map(0x00e0, 0x00ef).rw(FUNC(cbm2hp_state::cobalt_reg_r), FUNC(cbm2hp_state::cobalt_reg_w));
+}
+
+//-------------------------------------------------
+//  Cobalt CPLD register file (0xE0-0xEF). offset = low nibble. See DEVICE_SPEC.md.
+//-------------------------------------------------
+
+uint8_t cbm2hp_state::cobalt_reg_r(offs_t offset)
+{
+	uint8_t data = 0xff;
+
+	switch (offset)
+	{
+	case 0x02: // REG_IO: I2C readback - bit0=SDA line, bit1=SCL line, bit7=IO_ENABLE
+	{
+		int sda_line = m_i2c_sda & m_i2c_slave_sda;   // open-drain wired-AND
+		data = (data & ~0x03) | (sda_line ? 0x01 : 0x00) | (m_i2c_scl ? 0x02 : 0x00);
+		return data;                                  // (no logging - bitbang would flood)
+	}
+
+	case 0x0f: // REG_VERSION: high nibble 0 => chipset present; low nibble = revision (1)
+		data = 0x01;
+		break;
+
+	default:
+		break;
+	}
+
+	if (!machine().side_effects_disabled())
+		logerror("%s: cobalt R %02X = %02X\n", machine().describe_context(), 0xe0 + offset, data);
+
+	return data;
+}
+
+void cbm2hp_state::cobalt_reg_w(offs_t offset, uint8_t data)
+{
+	if (offset == 0x02)   // REG_IO: I2C bitbang - bit0 drives SDA, bit1 drives SCL (1=release)
+	{
+		i2c_io(BIT(data, 0), BIT(data, 1));
+		return;           // (no per-write log - the 8088 bitbangs thousands of edges)
+	}
+
+	// REG_DISABLE(8)/REG_ENABLE(9) = IO_ENABLE toggles around every real-I/O access;
+	// the INT_16 keyboard wait loop hits them millions of times - don't log them
+	// (they flooded error.log past its ~5.28M-line truncation point).
+	if (offset != 0x08 && offset != 0x09)
+		logerror("%s: cobalt W %02X = %02X\n", machine().describe_context(), 0xe0 + offset, data);
+	// TODO increment 2+: REG_CONFIG(4) banking, REG_HWCONF(A), NMI enable, SPI
+}
+
+
+//-------------------------------------------------
+//  Cobalt I2C bus (REG_IO $E2) - minimal slave state machine for the RTC ($D0) and
+//  EEPROM ($A0/$A2) probed by payload/i2c.asm + hardware.asm. Open-drain SDA/SCL:
+//  the master (8088) releases a line by writing 1; a slave ACKs by pulling SDA low.
+//-------------------------------------------------
+
+void cbm2hp_state::cobalt_i2c_init()
+{
+	m_i2c_sda = m_i2c_scl = 1;
+	m_i2c_slave_sda = 1;
+	m_i2c_state = I2C_IDLE;
+	m_i2c_bitcnt = 0;
+	m_i2c_shift = m_i2c_out = 0;
+	m_i2c_dev = I2C_DEV_NONE;
+	m_i2c_reading = m_i2c_got_ptr = m_i2c_ack = 0;
+	m_i2c_ptr = 0;
+
+	std::fill(std::begin(m_i2c_eeprom), std::end(m_i2c_eeprom), 0xff);
+	std::fill(std::begin(m_i2c_rtc), std::end(m_i2c_rtc), 0x00);
+	// CMOS config in RTC NVRAM (offset $08, 56 bytes) = what Config_Zero writes:
+	// {$10, 54x$00, $B0}; $B0 is the firmware's precomputed CRC-8 so Config_CRC passes.
+	m_i2c_rtc[0x08] = 0x10;
+	m_i2c_rtc[0x3f] = 0xb0;
+}
+
+uint8_t cbm2hp_state::i2c_dev_read()
+{
+	uint8_t v = (m_i2c_dev == I2C_DEV_RTC) ? m_i2c_rtc[m_i2c_ptr & 0x3f] : m_i2c_eeprom[m_i2c_ptr];
+	m_i2c_ptr++;
+	return v;
+}
+
+void cbm2hp_state::i2c_dev_write(uint8_t v)
+{
+	if (!m_i2c_got_ptr)                  // first byte after a write-address = register pointer
+	{
+		m_i2c_ptr = v;
+		m_i2c_got_ptr = 1;
+	}
+	else
+	{
+		if (m_i2c_dev == I2C_DEV_RTC) m_i2c_rtc[m_i2c_ptr & 0x3f] = v;
+		else                          m_i2c_eeprom[m_i2c_ptr] = v;
+		m_i2c_ptr++;
+	}
+}
+
+void cbm2hp_state::i2c_io(int sda, int scl)
+{
+	int old_sda = m_i2c_sda, old_scl = m_i2c_scl;
+
+	if (old_scl && scl && old_sda != sda)
+	{
+		// SDA transition while SCL high = START (SDA falls) or STOP (SDA rises)
+		if (old_sda && !sda)
+		{
+			m_i2c_state = I2C_RX_ADDR;   // (repeated) start: ptr is preserved for restart-read
+			m_i2c_bitcnt = 0;
+			m_i2c_shift = 0;
+			m_i2c_slave_sda = 1;
+		}
+		else
+		{
+			m_i2c_state = I2C_IDLE;
+			m_i2c_dev = I2C_DEV_NONE;
+			m_i2c_slave_sda = 1;
+		}
+	}
+	else if (!old_scl && scl) i2c_scl_rising(sda);
+	else if (old_scl && !scl) i2c_scl_falling();
+
+	m_i2c_sda = sda;
+	m_i2c_scl = scl;
+}
+
+void cbm2hp_state::i2c_scl_rising(int sda)
+{
+	switch (m_i2c_state)
+	{
+	case I2C_RX_ADDR:
+	case I2C_RX_DATA:
+		m_i2c_shift = (m_i2c_shift << 1) | (sda & 1);   // sample receive bit (MSB first)
+		m_i2c_bitcnt++;                                 // count on the sampling edge
+		break;
+	case I2C_ACK_M:
+		m_i2c_ack = sda & 1;                            // master's ACK(0)/NAK(1) after a read
+		break;
+	default:
+		break;                                          // TX_DATA/ACK_S: master samples our line
+	}
+}
+
+void cbm2hp_state::i2c_scl_falling()
+{
+	switch (m_i2c_state)
+	{
+	case I2C_RX_ADDR:
+		if (m_i2c_bitcnt == 8)                          // 8 bits sampled (counted on rising)
+		{
+			uint8_t base = m_i2c_shift & 0xfe;
+			m_i2c_reading = m_i2c_shift & 1;
+			if (base == 0xd0)                      m_i2c_dev = I2C_DEV_RTC;
+			else if (base == 0xa0 || base == 0xa2) m_i2c_dev = I2C_DEV_EEPROM;
+			else                                   m_i2c_dev = I2C_DEV_NONE;
+			m_i2c_slave_sda = (m_i2c_dev != I2C_DEV_NONE) ? 0 : 1;   // ACK only if present
+			logerror("%s: I2C addr=%02X dev=%d %s -> %s\n", machine().describe_context(),
+				m_i2c_shift, m_i2c_dev, m_i2c_reading ? "RD" : "WR",
+				m_i2c_dev ? "ACK" : "NAK");
+			if (!m_i2c_reading) m_i2c_got_ptr = 0;                   // write: expect pointer next
+			m_i2c_state = I2C_ACK_S;
+			m_i2c_bitcnt = 0;
+		}
+		break;
+
+	case I2C_RX_DATA:
+		if (m_i2c_bitcnt == 8)
+		{
+			i2c_dev_write(m_i2c_shift);
+			m_i2c_slave_sda = 0;                   // ACK the received byte
+			m_i2c_state = I2C_ACK_S;
+			m_i2c_bitcnt = 0;
+		}
+		break;
+
+	case I2C_ACK_S:                                // end of slave-ACK clock -> next phase
+		m_i2c_slave_sda = 1;
+		if (m_i2c_dev == I2C_DEV_NONE)
+		{
+			m_i2c_state = I2C_IDLE;
+		}
+		else if (m_i2c_reading)
+		{
+			m_i2c_out = i2c_dev_read();
+			m_i2c_slave_sda = (m_i2c_out >> 7) & 1;
+			m_i2c_bitcnt = 0;
+			m_i2c_state = I2C_TX_DATA;
+		}
+		else
+		{
+			m_i2c_shift = 0;
+			m_i2c_bitcnt = 0;
+			m_i2c_state = I2C_RX_DATA;
+		}
+		break;
+
+	case I2C_TX_DATA:
+		if (++m_i2c_bitcnt == 8)
+		{
+			m_i2c_slave_sda = 1;                   // release SDA for the master's ACK/NAK
+			m_i2c_state = I2C_ACK_M;
+		}
+		else
+		{
+			m_i2c_out <<= 1;
+			m_i2c_slave_sda = (m_i2c_out >> 7) & 1;
+		}
+		break;
+
+	case I2C_ACK_M:
+		if (m_i2c_ack == 0)                        // master ACK -> send another byte
+		{
+			m_i2c_out = i2c_dev_read();
+			m_i2c_slave_sda = (m_i2c_out >> 7) & 1;
+			m_i2c_bitcnt = 0;
+			m_i2c_state = I2C_TX_DATA;
+		}
+		else                                       // master NAK -> done, await STOP
+		{
+			m_i2c_slave_sda = 1;
+			m_i2c_state = I2C_IDLE;
+		}
+		break;
+
+	default:
+		break;
+	}
+}
+
+
+//-------------------------------------------------
+//  i8255 PPI - Cobalt IPC interface to the 6509
+//
+//  The replica swaps the original card's 6525 TPI for an 8255 (cobalt.pld /
+//  rom/ipc.asm). Port A = inputs, port B = bidirectional data bus shared with
+//  the 6509, port C = control outputs driven via BSR writes to the control reg:
+//    PC1 -> 6526 CIA(@$db00) FLAG pin (rising edge => IRQ on the 6509)
+//    PC5 -> bus release / DRAM_ENABLE arbitration
+//    PC6 -> 8088->6509 semaphore
+//    PC0 -> activity LED (toggled by led_main idle loop)
+//-------------------------------------------------
+
+uint8_t cbm2hp_state::ext_ppi_pa_r()
+{
+	/*
+	    bit0  pbbus1  - _BUSY1 from the 6509
+	    bit1  pbbus2  - !DRAM_ENABLE (CPLD PA1)
+	    bit3  pbsem65 - 6509->8088 semaphore
+	*/
+	uint8_t data = 0xf5;                                 // undriven bits read high
+	data &= ~0x08;                                       // clear bit3 (pbsem65) before driving
+	data |= m_ipc_dram_enable ? 0x00 : 0x02;            // PA1 = !DRAM_ENABLE
+	data |= m_ipc_sem65 ? 0x08 : 0x00;                  // PA3 = pbsem65 = 6509's CIA $db01 PB3
+	return data;
+}
+
+uint8_t cbm2hp_state::ext_ppi_pb_r()
+{
+	// Compose the shared IPC data bus as seen by the 8088 when its 8255 port B is an INPUT.
+	// Bits the 6509's CIA is driving (DDRA=1) come from the CIA's PRA (status_out / server
+	// output bytes); bits the 6509 is NOT driving (DDRA=0) FLOAT HIGH via the bus pull-ups
+	// (read as 1), they do NOT reflect the 8088's own m_ipc_data write latch.
+	//   Phantom-'.' fix (2026-07-02): the old model returned (m_ipc_data & ~ddra) for the
+	//   undriven bits. During a 6509 server transaction (DDRA=0, e.g. the heavy fn96 disk
+	//   traffic post-boot) a concurrent 8088 status poll (in al,21h in INT_16_00) then read
+	//   its own stale command byte instead of the pulled-up bus; if that byte had bit0=0 the
+	//   8088 saw "key available", called fn11, but the 6509 buffer was empty -> fn11 returned
+	//   its no-key placeholder (47) -> spurious '.' chars injected into DOS. Reading the
+	//   undriven bits as pull-up-high (no key) matches the real open-bus hardware and removes
+	//   the race. (When DDRA=$FF, as it is between transactions, this is identical to before.)
+	uint8_t data = m_ipc_cia_pra | (uint8_t)~m_ipc_cia_ddra;
+
+	// Phantom-'.' fix (2026-07-02). The 6509 drives this shared bus with two kinds of byte:
+	// the keyboard/serial STATUS (status_out, which always ORs in $C4 -> bits 7,6,2 set)
+	// between IPC transactions, and raw DATA/response bytes during a server transaction.
+	// The payload's port-B reads (INT_16 / IPC_IRQ2, all in F0000-F7FFF) are STATUS polls
+	// that test bit0 (key) / bit1 (serial); the ROM rqster's reads (>= F8000) consume raw
+	// DATA. A status poll that races the tail of a transaction can catch a stale data byte
+	// (bit0=0), mistake it for a keypress, and call fn11 -> which returns its no-key
+	// placeholder (47) -> spurious '.' chars injected into DOS. Latch the last genuine
+	// status byte; if a payload status poll sees a non-status byte, hand back the latch.
+	if (!machine().side_effects_disabled() && m_ext_cpu->pc() < 0xF8000)
+	{
+		if ((data & 0xC4) == 0xC4)
+			m_ipc_status = data;        // a genuine status_out byte the poll observed
+		else
+			data = m_ipc_status;        // stale transaction data -> use last valid status
+	}
+	return data;
+}
+
+void cbm2hp_state::ext_ppi_pb_w(uint8_t data)
+{
+	m_ipc_data = data;
+}
+
+void cbm2hp_state::ext_ppi_pc_w(uint8_t data)
+{
+	// DIAG F3: log FLAG (PC1) edges fed to the card CIA
+	if (BIT(data, 1) != BIT(m_ext_ppi_pc, 1))
+		logerror("%s: 8088 PC1(FLAG)=%d\n", machine().describe_context(), BIT(data, 1));
+
+	// PC1 -> card 6526 CIA($DB00) FLAG (rising edge => IRQ on the 6509 side)
+	m_ext_cia->flag_w(BIT(data, 1));
+
+	// PC6 -> 8088->6509 semaphore latch
+	int new_sem88 = BIT(data, 6);
+	if (m_ipc6509 && new_sem88 != m_ipc_sem88)
+		logerror("%s: 8088 sem88=%d (PC=%02X)\n", machine().describe_context(), new_sem88, data);
+	m_ipc_sem88 = new_sem88;
+
+	// PC5 -> bus release toggle (frees the shared DRAM for the 6509);
+	// full DRAM_ENABLE arbitration is wired in a later increment.
+
+	// DIAG: the 8088 writes the IPC command byte to the data port, then pulses PC1
+	// (INTERRUPT) to kick the 6509 server. Log the cmd on the PC1 rising edge (FLAG).
+	if (BIT(data, 1) && !BIT(m_ext_ppi_pc, 1))
+		logerror("%s: IPC cmd=%02X\n", machine().describe_context(), m_ipc_data);
+
+	m_ext_ppi_pc = data;
+}
+
+
+//-------------------------------------------------
+//  Cobalt IPC via the card's 6526 CIA @ $DB00 (extprtcs = Pleban's "IPCcia").
+//  port A = shared data bus to the 8088's 8255; port B = control:
+//    PB6 = INT0 (6509->8088). RUNCOPRO $FE33 writes $00 (PB6=0 => assert) then $40.
+//          CPLD: IR0.D=INT0 (-> 8259 IR0) and INT0 async-presets DRAM_ENABLE (8088 gets bus).
+//    PB0 = 8088-present flag (RUNCOPRO $FE40 reads it; must be 1 or it aborts).
+//-------------------------------------------------
+
+uint8_t cbm2hp_state::cobalt_cia_pb_r()
+{
+	// DDRB=$48 => PB3 (sem65) and PB6 (INT0) are outputs (device returns PRB for those);
+	// this callback only supplies the INPUT bits:
+	//   bit0 = 8088 present (1, so RUNCOPRO $FE40 starts it)
+	//   bit2 = sem88 = the 8088's semaphore (8255 PC6).  KERNAL $fde6/$fdee poll it.
+	uint8_t data = 0xfb;                 // input bits high, bit2 cleared
+	data |= m_ipc_sem88 ? 0x04 : 0x00;   // PB2 = sem88
+	return data;
+}
+
+// ext_cia($DB00) port A <-> 8255 port B = the shared IPC data byte (m_ipc_data).
+// 8088 DIRECTION_OUT + DATA_WRITE drives m_ipc_data (ext_ppi_pb_w); the 6509 reads it here.
+// 6509 writes port A to send data the other way; the 8088 reads it via 8255 port B.
+uint8_t cbm2hp_state::cobalt_cia_pa_r()
+{
+	return m_ipc_data;
+}
+
+void cbm2hp_state::cobalt_cia_pa_w(uint8_t data)
+{
+	// DIAG F3: log 6509-driven data-bus changes (status_out writes the kbd status here)
+	static uint8_t last = 0xee;
+	if (data != last)
+	{
+		logerror("%s: 6509 CIA PA write change %02X -> %02X\n", machine().describe_context(), last, data);
+		last = data;
+	}
+	// Do NOT latch the composite into m_ipc_data: mos6526 fires this callback with
+	// pra|pa_in even when DDRA is being set to 0 (input), which used to overwrite the
+	// 8088's freshly written IPC command byte with $FF (the fn11-with-key wedge).
+	// The bus is composed per-DDRA in ext_ppi_pb_r / read via cobalt_cia_pa_r instead.
+}
+
+void cbm2hp_state::cobalt_cia_pb_w(uint8_t data)
+{
+	int int0 = !BIT(data, 6);           // PB6=0 => INT0 asserted (active low at the CPLD)
+
+	if (int0)
+		m_ipc_dram_enable = 1;          // DRAM_ENABLE.AP = INT0 (8088 gets the shared bus)
+
+	if (m_ext_pic)
+		m_ext_pic->ir0_w(int0);         // INT0 -> 8259 IR0 -> 8088 leaves led_main (intrpt)
+
+	if (int0 != m_ipc_int0)
+		logerror("%s: IPC INT0=%d (ext_cia PB=%02X) -> 8088 IR0\n", machine().describe_context(), int0, data);
+	m_ipc_int0 = int0;
+
+	// PB7 = card CIA TimerB output (CtrlB=$17 PB7-toggle, programmed by ipc_18_init at
+	// ~18.2 Hz) -> 8259 IR7 -> 8088 IPC_IRQ7 (Screen_Interrupt refresh + INT 08 ticks).
+	if (m_ext_pic)
+		m_ext_pic->ir7_w(BIT(data, 7));
+
+	// PB3 = sem65 = the 6509's semaphore -> 8255 PA3 (pbsem65). KERNAL server $fd48
+	// raises it ($fdff: ORA #$08) to ack the 8088 cmd, clears it ($fdf6: AND #$f7).
+	int sem65 = BIT(data, 3);
+	if (sem65 != m_ipc_sem65)
+		logerror("%s: IPC sem65=%d (ext_cia PB=%02X) -> 8255 PA3\n", machine().describe_context(), sem65, data);
+	m_ipc_sem65 = sem65;
 }
 
 
@@ -1910,8 +2501,13 @@ uint8_t cbm2_state::ext_tpi_pb_r()
 	// _BUSY2
 	data |= m_busy2 << 1;
 
-	// CIA
-	data |= m_ext_tpi_pb & m_ext_cia_pb & 0x3c;
+	// native-hybrid (2026-07-03): 8088 reads TPI PRB. Cross-wire the semaphores respecting DDR
+	// instead of a plain wired-AND (which ANDed each input bit with the reader's stale latch and
+	// deadlocked the IPC): bit3 (ACK/sem65, an 8088 INPUT) = the 6509's driven CIA PB bit3;
+	// bit2 (REQ, an 8088 OUTPUT) reads back own latch; bits 4/5 = own.
+	data |= BIT(m_ext_tpi_pb, 2) << 2;   // REQ (own)
+	data |= BIT(m_ext_cia_pb, 3) << 3;   // ACK = 6509 sem65
+	data |= m_ext_tpi_pb & 0x30;         // bits 4,5 DATA/DIR (own)
 
 	return data;
 }
@@ -1935,11 +2531,10 @@ void cbm2_state::ext_tpi_pb_w(uint8_t data)
 
 	m_ext_tpi_pb = data;
 
-	// _BUSY2
-	if (!BIT(data, 1))
-	{
-		set_busy2(0);
-	}
+	// NOTE: bit 1 (_BUSY2) is an INPUT on the 8088-side 6525 (DDRB=$44, only bits
+	// 2 and 6 are outputs), so a port-B write must NOT drive set_busy2 — the same
+	// latent-bug class as the ext_cia_pb_w bit-1 write removed on 2026-07-03b.
+	// (Verified byte-identical boot behavior with and without the old block.)
 
 	// FLAG
 	m_ext_cia->flag_w(BIT(data, 6));
@@ -1970,11 +2565,47 @@ void cbm2_state::ext_tpi_pc_w(uint8_t data)
 }
 
 //-------------------------------------------------
+//  native-hybrid IPC data bus (6525 TPI PA <-> card CIA PA)
+//
+//  The vanilla model wired the two ports' pa_r callbacks at each other (circular), which
+//  corrupted the 6509->8088 direction during DDRA transitions (scrambled keyboard echo /
+//  cursor). Model it the cobalt way instead: one latch per driving side, each reader taking
+//  the OTHER side's driven byte for its input bits (the mos6526/tpi6525 pa_r already masks in
+//  the callback only for DDRA=input bits). Half-duplex, so this is unambiguous.
+//-------------------------------------------------
+
+// 8088 reads TPI PA  -> the byte the 6509 last drove onto the card CIA PRA.
+uint8_t cbm2_state::ext_tpi_pa_r()
+{
+	return m_ipc_cia_pra | (uint8_t)~m_ipc_cia_ddra;
+}
+
+// 8088 writes TPI PA -> latch it as the byte the 8088 drives onto the bus.
+void cbm2_state::ext_tpi_pa_w(uint8_t data)
+{
+	m_ipc_data_88 = data;
+}
+
+// 6509 reads card CIA PA -> the byte the 8088 last drove.
+uint8_t cbm2_state::ext_cia_pa_r()
+{
+	return m_ipc_data_88;
+}
+
+//-------------------------------------------------
 //  MOS6526_INTERFACE( ext_cia_intf )
 //-------------------------------------------------
 
 void cbm2_state::ext_cia_irq_w(int state)
 {
+	// DIAG F3/native: trace the card-CIA IRQ edges feeding TPI1 I3 (IPC FLAG path).
+	// Ungated so it also fires for bx256hp (native MS-DOS RE, 2026-07-03).
+	static int last = -1;
+	if (state != last)
+	{
+		logerror("%s: ext CIA IRQ=%d -> TPI1 I3=%d\n", machine().describe_context(), state, !state);
+		last = state;
+	}
 	m_tpi1->i3_w(!state);
 }
 
@@ -2003,8 +2634,12 @@ uint8_t cbm2_state::ext_cia_pb_r()
 	// _BUSY2
 	data |= m_busy2 << 1;
 
-	// TPI
-	data |= m_ext_tpi_pb & m_ext_cia_pb & 0x3c;
+	// native-hybrid (2026-07-03): 6509 reads card CIA PRB. Cross-wire semaphores respecting DDR:
+	// bit2 (sem88, a 6509 INPUT) = the 8088's driven TPI PRB bit2 (REQ); bit3 (sem65, a 6509
+	// OUTPUT via DDRB=$48) reads back own latch; bits 4/5 = the 8088's DATA/DIR.
+	data |= BIT(m_ext_tpi_pb, 2) << 2;   // sem88 = 8088 REQ
+	data |= BIT(m_ext_cia_pb, 3) << 3;   // sem65 (own)
+	data |= m_ext_tpi_pb & 0x30;         // bits 4,5 DATA/DIR (8088)
 
 	return data;
 }
@@ -2028,12 +2663,11 @@ void cbm2_state::ext_cia_pb_w(uint8_t data)
 
 	m_ext_cia_pb = data;
 
-	// _BUSY2
-	if (!BIT(data, 1))
-	{
-		set_busy2(0);
-	}
-
+	// native-hybrid fix (2026-07-03): $DB01 bit1 (_BUSY2) is an INPUT (DDRB=$48 -> only PB3/PB6
+	// are outputs); the vanilla `if(!BIT(data,1)) set_busy2(0)` wrongly acted on the 6509's
+	// routine PRB writes (e.g. boot $DB01=$40), dropping m_busen1 and corrupting the 6509 PLA
+	// memory decode -> the bx256hp BASIC $8934 hang. Only the bit6 (INT0/RUNCOPRO) path legit-
+	// imately hands the DRAM bus to the 8088 for cold-start, so keep that one.
 	if (!BIT(data, 6))
 	{
 		set_busy2(0);
@@ -2720,7 +3354,16 @@ void cbm2hp_state::bx256hp(machine_config &config)
 	b256hp(config);
 	MCFG_MACHINE_START_OVERRIDE(cbm2_state, cbm2x_ntsc)
 
-	I8088(config, m_ext_cpu, XTAL(12'000'000));
+	// native-hybrid (2026-07-03): fine scheduling quantum so the 8088's IPC poll loop and the
+	// 6509's KERNAL keyboard scan / IPC server interleave. Without it the 8088 runs a whole poll
+	// burst inside one 6509 timeslice, starving the keyboard scan (only the 1st key registered).
+	config.set_maximum_quantum(attotime::from_usec(2));
+
+	// schematic 326235 pg-1: Y1 = 15 MHz crystal into the 8284A (U2), which divides by 3
+	// -> 5 MHz 8088 CPU clock. Feeding the raw crystal ran the 8088 2.4x too fast, so its
+	// fn10 poll turnaround always beat the 6509's IRQ unwind and starved the base context
+	// (jiffy/keyboard never progressed once MS-DOS started polling).
+	I8088(config, m_ext_cpu, XTAL(15'000'000)/3);
 	m_ext_cpu->set_addrmap(AS_PROGRAM, &cbm2hp_state::ext_mem);
 	m_ext_cpu->set_addrmap(AS_IO, &cbm2hp_state::ext_io);
 	m_ext_cpu->set_irq_acknowledge_callback(EXT_I8259A_TAG, FUNC(pic8259_device::inta_cb));
@@ -2729,7 +3372,9 @@ void cbm2hp_state::bx256hp(machine_config &config)
 	m_ext_pic->out_int_callback().set_inputline(m_ext_cpu, INPUT_LINE_IRQ0);
 
 	TPI6525(config, m_ext_tpi, 0);
-	m_ext_tpi->in_pa_cb().set(m_ext_cia, FUNC(mos6526_device::pa_r));
+	// native-hybrid: clean IPC data bus (latch) instead of the circular pa_r <-> pa_r wiring.
+	m_ext_tpi->in_pa_cb().set(FUNC(cbm2_state::ext_tpi_pa_r));
+	m_ext_tpi->out_pa_cb().set(FUNC(cbm2_state::ext_tpi_pa_w));
 	m_ext_tpi->in_pb_cb().set(FUNC(cbm2_state::ext_tpi_pb_r));
 	m_ext_tpi->out_pb_cb().set(FUNC(cbm2_state::ext_tpi_pb_w));
 	m_ext_tpi->out_pc_cb().set(FUNC(cbm2_state::ext_tpi_pc_w));
@@ -2737,11 +3382,53 @@ void cbm2hp_state::bx256hp(machine_config &config)
 	MOS6526(config, m_ext_cia, XTAL(18'000'000)/9);
 	m_ext_cia->set_tod_clock(60);
 	m_ext_cia->irq_wr_callback().set(FUNC(cbm2_state::ext_cia_irq_w));
-	m_ext_cia->pa_rd_callback().set(m_ext_tpi, FUNC(tpi6525_device::pa_r));
+	m_ext_cia->pa_rd_callback().set(FUNC(cbm2_state::ext_cia_pa_r));
 	m_ext_cia->pb_rd_callback().set(FUNC(cbm2_state::ext_cia_pb_r));
 	m_ext_cia->pb_wr_callback().set(FUNC(cbm2_state::ext_cia_pb_w));
 
 	SOFTWARE_LIST(config, "flop_list2").set_original("bx256hp_flop");
+}
+
+
+//-------------------------------------------------
+//  machine_config( cbm2cobalt ) - Pleban 8088 replica
+//-------------------------------------------------
+
+void cbm2hp_state::cbm2cobalt(machine_config &config)
+{
+	bx256hp(config);
+
+	// Pleban replica: modern CMOS 8088 clocked faster than the original card. Keep the
+	// 12 MHz this machine was verified with (PC-DOS 3.30 boots) now that bx256hp uses
+	// the original card's 5 MHz.
+	m_ext_cpu->set_clock(XTAL(12'000'000));
+
+	// The 6509 KERNAL IPC server ($FD48) pulses sem65 high for only ~30 6509 cycles
+	// ($FDFF raise -> $FDF6 clear) and the 8088 rqster must catch that edge by polling.
+	// With the default scheduling quantum the whole pulse can run inside one 6509
+	// timeslice and the 8088 misses it -> semaphore deadlock ($FDEE vs rqst030).
+	config.set_maximum_quantum(attotime::from_usec(2));
+
+	// 64K BIOS EPROM (8088.bin) mapped across F0000-FFFFF instead of the original 4K ROM
+	m_ext_cpu->set_addrmap(AS_PROGRAM, &cbm2hp_state::ext_mem_cobalt);
+	// Cobalt CPLD register file at 0xE0-0xEF (REG_VERSION etc.)
+	m_ext_cpu->set_addrmap(AS_IO, &cbm2hp_state::ext_io_cobalt);
+
+	// IPC interface: i8255 PPI @ 0x20 (replica replaces the original 6525 TPI).
+	// The TPI from bx256hp() stays instantiated but is no longer in the 8088 I/O map.
+	I8255(config, m_ext_ppi);
+	m_ext_ppi->in_pa_callback().set(FUNC(cbm2hp_state::ext_ppi_pa_r));
+	m_ext_ppi->in_pb_callback().set(FUNC(cbm2hp_state::ext_ppi_pb_r));
+	m_ext_ppi->out_pb_callback().set(FUNC(cbm2hp_state::ext_ppi_pb_w));
+	m_ext_ppi->out_pc_callback().set(FUNC(cbm2hp_state::ext_ppi_pc_w));
+
+	// IPC control channel = the card's 6526 CIA @ $DB00 (extprtcs = Pleban's "IPCcia").
+	// RUNCOPRO ($FE33) drives its port B: writes $00 (PB6=0 => INT0 asserted) then $40.
+	m_ext_cia->pb_rd_callback().set(FUNC(cbm2hp_state::cobalt_cia_pb_r));
+	m_ext_cia->pb_wr_callback().set(FUNC(cbm2hp_state::cobalt_cia_pb_w));
+	// port A = shared IPC data bus, cross-connected to the 8255 port B.
+	m_ext_cia->pa_rd_callback().set(FUNC(cbm2hp_state::cobalt_cia_pa_r));
+	m_ext_cia->pa_wr_callback().set(FUNC(cbm2hp_state::cobalt_cia_pa_w));
 }
 
 
@@ -2791,7 +3478,8 @@ void cbm2hp_state::cbm730(machine_config &config)
 	cbm720(config);
 	MCFG_MACHINE_START_OVERRIDE(cbm2_state, cbm2x_pal)
 
-	I8088(config, m_ext_cpu, XTAL(12'000'000));
+	// 15 MHz crystal / 3 via the 8284A = 5 MHz (see bx256hp)
+	I8088(config, m_ext_cpu, XTAL(15'000'000)/3);
 	m_ext_cpu->set_addrmap(AS_PROGRAM, &cbm2hp_state::ext_mem);
 	m_ext_cpu->set_addrmap(AS_IO, &cbm2hp_state::ext_io);
 	m_ext_cpu->set_irq_acknowledge_callback(EXT_I8259A_TAG, FUNC(pic8259_device::inta_cb));
@@ -3031,6 +3719,38 @@ ROM_END
 
 
 //-------------------------------------------------
+//  ROM( cbm2cobalt ) - Pleban 8088 "Cobalt" replica firmware
+//-------------------------------------------------
+
+ROM_START( cbm2cobalt )
+	ROM_REGION( 0x4000, "basic", 0 )
+	ROM_LOAD( "901241-03.u59", 0x0000, 0x2000, CRC(5c1f3347) SHA1(2d46be2cd89594b718cdd0a86d51b6f628343f42) )
+	ROM_LOAD( "901240-03.u60", 0x2000, 0x2000, CRC(72aa44e1) SHA1(0d7f77746290afba8d0abeb87c9caab9a3ad89ce) )
+
+	// Pleban 64K 8088 BIOS EPROM (U7D, 27C512)
+	ROM_REGION( 0x10000, EXT_I8088_TAG, 0 )
+	ROM_LOAD( "8088.bin", 0x0000, 0x10000, CRC(eecc3970) SHA1(45122f1b5050da85903a0573835671187a84a78c) )
+
+	// Pleban 6509-side IPC ROM (U2C, 27C64) - wired into the CBM-II bus in a later increment
+	ROM_REGION( 0x2000, "ipc6509", 0 )
+	ROM_LOAD( "6509.bin", 0x0000, 0x2000, CRC(dcd48d45) SHA1(deaddc55aaf493c9e89ef0bc911e3264cfad2fdd) )
+
+	ROM_REGION( 0x2000, "kernal", 0 )
+	ROM_DEFAULT_BIOS("r2")
+	ROM_SYSTEM_BIOS( 0, "r1", "Revision 1" )
+	ROMX_LOAD( "901244-03b.u61", 0x0000, 0x2000, CRC(4276dbba) SHA1(a624899c236bc4458570144d25aaf0b3be08b2cd), ROM_BIOS(0) )
+	ROM_SYSTEM_BIOS( 1, "r2", "Revision 2" )
+	ROMX_LOAD( "901244-04a.u61", 0x0000, 0x2000, CRC(09a5667e) SHA1(abb26418b9e1614a8f52bdeee0822d4a96071439), ROM_BIOS(1) )
+
+	ROM_REGION( 0x1000, "charom", 0 )
+	ROM_LOAD( "901232-01.u25", 0x0000, 0x1000, CRC(3a350bc3) SHA1(e7f3cbc8e282f79a00c3e95d75c8d725ee3c6287) )
+
+	ROM_REGION( 0xf5, PLA1_TAG, 0 )
+	ROM_LOAD( "906114-05.u75", 0x00, 0xf5, CRC(ff6ba6b6) SHA1(45808c570eb2eda7091c51591b3dbd2db1ac646a) )
+ROM_END
+
+
+//-------------------------------------------------
 //  ROM( cbm720_de )
 //-------------------------------------------------
 
@@ -3088,6 +3808,10 @@ COMP( 1983, cbm620_hu, b500,   0,      cbm620,    cbm2_hu, cbm2_state,   empty_i
 COMP( 1983, b128hp,    0,      0,      b128hp,    cbm2,    cbm2hp_state, empty_init, "Commodore Business Machines",  "B128-80HP",                MACHINE_SUPPORTS_SAVE )
 COMP( 1983, b256hp,    b128hp, 0,      b256hp,    cbm2,    cbm2hp_state, empty_init, "Commodore Business Machines",  "B256-80HP",                MACHINE_SUPPORTS_SAVE )
 COMP( 1983, bx256hp,   b128hp, 0,      bx256hp,   cbm2,    cbm2hp_state, empty_init, "Commodore Business Machines",  "BX256-80HP",               MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE ) // 8088 co-processor is missing
+// TODO: cbm2cobalt is currently cloneof bx256hp (itself a clone) -> -validate warns
+// "clone of a clone". Runs fine for development; before upstreaming make it a proper parent
+// with a self-contained romset (copy shared ROMs into roms/cbm2cobalt/).
+COMP( 2019, cbm2cobalt, bx256hp, 0,     cbm2cobalt, cbm2,  cbm2hp_state, empty_init, "Commodore / Michal Pleban",    "CBM-II with 8088 Cobalt card (Pleban replica)", MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
 COMP( 1983, cbm710,    b128hp, 0,      cbm710,    cbm2,    cbm2hp_state, empty_init, "Commodore Business Machines",  "CBM 710",                  MACHINE_SUPPORTS_SAVE )
 COMP( 1983, cbm720,    b128hp, 0,      cbm720,    cbm2,    cbm2hp_state, empty_init, "Commodore Business Machines",  "CBM 720",                  MACHINE_SUPPORTS_SAVE )
 COMP( 1983, cbm720_de, b128hp, 0,      cbm720,    cbm2_de, cbm2hp_state, empty_init, "Commodore Business Machines",  "CBM 720 (Germany)",        MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
