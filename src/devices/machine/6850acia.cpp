@@ -497,10 +497,19 @@ void acia6850_device::write_txc(int state)
 			switch (m_tx_state)
 			{
 			case STATE_START:
-				m_tx_counter = 0;
-
+				/* EXPERIMENT (Alfaskop keyboard link): a character queued
+				   behind a finishing frame does not start back-to-back;
+				   it waits until the line has idled for one full bit
+				   time.  A write into an idle transmitter still starts
+				   immediately (counter is left saturated below), so
+				   request/response traffic is unaffected - only chained
+				   multi-byte bursts acquire the 1-bit gap. */
 				if (!(m_status & SR_TDRE) && !(m_status & SR_CTS))
 				{
+					if (m_tx_counter < m_divide)
+						break;
+					m_tx_counter = 0;
+
 					LOG("MC6850 '%s': TX DATA %x\n", tag(), m_tdr);
 
 					m_tx_state = STATE_DATA;
@@ -515,6 +524,8 @@ void acia6850_device::write_txc(int state)
 				}
 				else
 				{
+					m_tx_counter = m_divide;
+
 					/// TODO: find out if break stops transmitter
 					output_txd(!m_brk);
 				}
