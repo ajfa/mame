@@ -43,6 +43,7 @@ protected:
 	uint8_t m_leds;
 
 	void alfaskop_s41_kb_mem(address_map &map) ATTR_COLD;
+	uint8_t read_rows();
 };
 
 #endif // MAME_SKELETON_ALFASKOP_S41_KB_H

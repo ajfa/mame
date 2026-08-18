@@ -43,7 +43,7 @@
 #define LOG_ADEC    (1U << 7)
 #define LOG_IO      (1U << 8)
 
-//#define VERBOSE (LOG_GENERAL|LOG_IO|LOG_IRQ|LOG_LEDS|LOG_BITS|LOG_RESET)
+#define VERBOSE (LOG_GENERAL|LOG_IRQ|LOG_BITS|LOG_RESET)
 //#define LOG_OUTPUT_STREAM std::cout
 
 #include "logmacro.h"
@@ -148,22 +148,22 @@ INPUT_PORTS_START(alfaskop_s41_kb)
 	PORT_BIT( 0x0040, IP_ACTIVE_LOW, IPT_UNUSED )                                                                                                   // 88 - no key
 	PORT_BIT( 0x0080, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("F9")         PORT_CODE(KEYCODE_F9)        PORT_CHAR(UCHAR_MAMEKEY(F9))               // 67
 	PORT_BIT( 0x0100, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("F10")        PORT_CODE(KEYCODE_F10)       PORT_CHAR(UCHAR_MAMEKEY(F10))              // 68
-	PORT_BIT( 0x0200, IP_ACTIVE_LOW, IPT_UNUSED )                                                                                                   // scan code ff - keyboard error
+	PORT_BIT( 0x0200, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("Unknown 94")  PORT_CODE(KEYCODE_HOME)                                                  // 94 - PROBE
 	PORT_BIT( 0x0400, IP_ACTIVE_LOW, IPT_KEYBOARD )                         PORT_CODE(KEYCODE_BACKSLASH) PORT_CHAR('\\')                            // 43
 	PORT_BIT( 0x0800, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("CAPS LOCK")  PORT_CODE(KEYCODE_CAPSLOCK)  PORT_CHAR(UCHAR_MAMEKEY(CAPSLOCK))         // 58
 	PORT_BIT( 0x1000, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("SHIFT LOCK") PORT_CODE(KEYCODE_LALT)                                                 // 56
-	PORT_BIT( 0x2000, IP_ACTIVE_LOW, IPT_UNUSED )                                                                                                   // 85 - no key
+	PORT_BIT( 0x2000, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("Unknown 85")  PORT_CODE(KEYCODE_INSERT)                                                // 85 - PROBE
 	PORT_BIT( 0x4000, IP_ACTIVE_LOW, IPT_KEYBOARD )                         PORT_CODE(KEYCODE_V)         PORT_CHAR('v') PORT_CHAR('V')              // 47
 	PORT_BIT( 0x8000, IP_ACTIVE_LOW, IPT_KEYBOARD )                         PORT_CODE(KEYCODE_SPACE)     PORT_CHAR(' ')                             // 57
 
 	PORT_START("P10")
 	PORT_BIT( 0x0001, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("KP 3")     PORT_CODE(KEYCODE_3_PAD) PORT_CODE(KEYCODE_PGDN)                           // 81
-	PORT_BIT( 0x0002, IP_ACTIVE_LOW, IPT_UNUSED )                                                                                                    // ff - keyboard error
+	PORT_BIT( 0x0002, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("Unknown 90")  PORT_CODE(KEYCODE_END)                                                    // 90 - PROBE
 	PORT_BIT( 0x0004, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("KP 2")     PORT_CODE(KEYCODE_2_PAD) PORT_CODE(KEYCODE_DOWN) PORT_CHAR(UCHAR_MAMEKEY(2_PAD)) // 80
 	PORT_BIT( 0x0008, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("NEW LINE") PORT_CODE(KEYCODE_ENTER_PAD)  PORT_CHAR(UCHAR_MAMEKEY(ENTER_PAD))          // 84 (programmable, default is 28)
 	PORT_BIT( 0x0010, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("KP 1")     PORT_CODE(KEYCODE_1_PAD) PORT_CHAR(UCHAR_MAMEKEY(1_PAD))                   // 79
 	PORT_BIT( 0x0020, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("KP 4")     PORT_CODE(KEYCODE_4_PAD) PORT_CODE(KEYCODE_LEFT) PORT_CHAR('4') PORT_CHAR(UCHAR_MAMEKEY(LEFT))     // 75
-	PORT_BIT( 0x0040, IP_ACTIVE_LOW, IPT_UNUSED )                                                                                                    // ff - keyboard error
+	PORT_BIT( 0x0040, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("Unknown 91")  PORT_CODE(KEYCODE_PGUP)                                                   // 91 - PROBE
 	PORT_BIT( 0x0080, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("F7")       PORT_CODE(KEYCODE_F7)         PORT_CHAR(UCHAR_MAMEKEY(F7))                 // 65
 	PORT_BIT( 0x0100, IP_ACTIVE_LOW, IPT_KEYBOARD ) PORT_NAME("F8")       PORT_CODE(KEYCODE_F8)         PORT_CHAR(UCHAR_MAMEKEY(F8))                 // 66
 	PORT_BIT( 0x0200, IP_ACTIVE_LOW, IPT_KEYBOARD )                       PORT_CODE(KEYCODE_LSHIFT) PORT_CHAR(UCHAR_SHIFT_1)                         // 42
@@ -226,7 +226,16 @@ alfaskop_s41_keyboard_device::alfaskop_s41_keyboard_device(
 void alfaskop_s41_keyboard_device::rxd_w(int state)
 {
 	LOGBITS("KBD bit presented: %d\n", state);
-	//m_rxd_high = CLEAR_LINE != state;
+	// The receive path is INVERTED into the port: the firmware idles with
+	// P0 = 0, starts reception when P0 goes high (ISR $FCE1: LSRA/BCC exit)
+	// and inserts a 1 data bit when P0 reads 0 (timer ISR $FD31: BCC ->
+	// ORAA #$80).  The same inverted line reaches CP2 (the ISR dispatches
+	// the start-bit on CSR bit 2; CP1/CSR bit 1 is the MID interrupt), and
+	// its rising edge (PCR bit 4 = 1) is the start-bit wakeup.  The transmit
+	// path (P1) is NOT inverted - drive and receive gates of the shared
+	// line differ.
+	m_rxd_high = state == 0;
+	m_mc6846->set_input_cp2(m_rxd_high ? 1 : 0);
 }
 
 // void alfaskop_s41_keyboard_device::hold_w(int state)
@@ -246,6 +255,42 @@ void alfaskop_s41_keyboard_device::rst_line_w(int state)
 		m_mcu->set_input_line(INPUT_LINE_RESET, ASSERT_LINE);
 		LOGRST("KBD: Keyboard mcu reset line is asserted\n");
 	}
+}
+
+//-------------------------------------------------
+//  read_rows - row byte for the column currently
+//  selected by the walking zero
+//
+//  Key numbers are the firmware's own coordinates: its scan loop stores one
+//  row byte per column at $70-$7F and tests bit (keynum & 7) of byte
+//  (keynum >> 3), so keynum = column * 8 + row.  The LS240 read gates invert,
+//  so a depressed key reads as a one.  The table maps each input port bit to
+//  its key number (from the per-key comments in the port definitions).
+//-------------------------------------------------
+
+uint8_t alfaskop_s41_keyboard_device::read_rows()
+{
+	static constexpr uint8_t keynum[6][16] =
+	{
+		{   81,   90,   80,   84,   79,   75,   91,   65,   66,   42,   44,   50,   30,   31,   48,   49 }, // P10
+		{   83,   28,   82, 0xff, 0xff, 0xff, 0xff,   67,   68,   94,   43,   58,   56,   85,   47,   57 }, // P11
+		{   73,   74,   72,   41,   40,   39,   38,   61,   62,   16,   15,   37,   33,   34,   35,   22 }, // P12
+		{   69, 0xff,   14,   13,   12,   11,   10,    2,    1,    3,    4,    9,    5,    6,    7,    8 }, // P13
+		{ 0xff,   70,   71, 0xff,   27,   26,   25,   59,   60,   17,   18,   24,   19,   20,   21,   23 }, // P14
+		{   77,   78,   76,   55,   54,   53,   52,   63,   64, 0xff,   29,   51,   32,   45,   46,   36 }, // P15
+	};
+
+	uint8_t rows = 0;
+	for (int p = 0; p < 6; p++)
+	{
+		uint16_t const pressed = ~m_rows[p]->read(); // ports are active low
+		if (!pressed)
+			continue;
+		for (int b = 0; b < 16; b++)
+			if (BIT(pressed, b) && keynum[p][b] != 0xff && (keynum[p][b] >> 3) == m_col_select)
+				rows |= 1 << (keynum[p][b] & 7);
+	}
+	return rows;
 }
 
 //-------------------------------------------------
@@ -281,8 +326,27 @@ void alfaskop_s41_keyboard_device::device_add_mconfig(machine_config &config)
 				m_mcu->set_input_line(M6802_IRQ_LINE, state);
 			});
 	m_mc6846->cp2().set([this](bool state){ LOG("CP2:%d\n", state); });
-	// MIA ID interrupt: m_mc6846->set_input_cp1(1);
 	m_mc6846->cto().set([this](bool state){ LOG("CTO:%d\n", state); }); // Not connected to anything
+
+	// Port wiring, from RE of the KBC firmware (DDR = $F2):
+	//   P0 in  = serial RX line (also on CP1 for the start-bit edge)
+	//   P1 out = serial TX line (idle mark; PDR init $E2 has it high)
+	//   P2 in  = MID ID data, P3 in = MID COSI (idle high, no MID fitted)
+	//   P4 out = alarm, P5 out = click / line driver, P6-P7 out = unused
+	m_mc6846->in_port().set([this]() -> uint8_t
+			{
+				return (m_rxd_high ? 0x01 : 0x00) | 0x0c;
+			});
+	m_mc6846->out_port().set([this](offs_t, uint8_t data)
+			{
+				bool const txd = BIT(data, 1);
+				if (txd != m_txd_high)
+				{
+					m_txd_high = txd;
+					LOGBITS("KBD tx bit: %d\n", txd ? 1 : 0);
+					m_txd_cb(txd ? 1 : 0);
+				}
+			});
 }
 
 //-------------------------------------------------
@@ -300,7 +364,7 @@ ioport_constructor alfaskop_s41_keyboard_device::device_input_ports() const
 
 void alfaskop_s41_keyboard_device::alfaskop_s41_kb_mem(address_map &map)
 {
-	map(0x0000, 0x007f).ram(); // Internal RAM
+	// 0x0000-0x007f is the 6802's internal RAM, mapped by the CPU device itself
 	/* A 32 byte decoder ROM connects A0-A4 to A11, A12, A13, A15 and to an external port pin, A14 is not decoded!
 	 * c3 c3 c3 c3 c3 c3 c3 c3 c3 c3 c3 c3 c3 c3 c3 c3 - if external port pin is low
 	 * c3 c3 c3 c3 c5 c6 cb c3 d3 c3 c3 c3 c3 c3 43 f3 - if external port pin is high - normal operation
@@ -349,6 +413,15 @@ void alfaskop_s41_keyboard_device::alfaskop_s41_kb_mem(address_map &map)
 						LOGIO(" - I/O read mc6846 %04x", addr & 0x07);
 						ret = m_mc6846->read((offs_t)(addr & 0x07));
 						LOGIO(": %02x\n", ret);
+						break;
+					case 0xc5: // Read col: the LS240 gates the selected column's row lines onto the bus
+						ret = read_rows();
+						if (!machine().side_effects_disabled())
+							m_col_select = (m_col_select + 1) & 15; // the same access clocks the column shift register
+						break;
+					case 0xc6: // Start scan: load the walking zero into the column shift register
+						if (!machine().side_effects_disabled())
+							m_col_select = 0;
 						break;
 					case 0xc3:
 						break; // Idle
